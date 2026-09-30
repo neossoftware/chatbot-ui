@@ -1,0 +1,266 @@
+{
+ "source": {
+  "kind": "paste"
+ },
+ "component_count": 8,
+ "overall_score": 53.0,
+ "is_partial": false,
+ "total_monthly_saving_usd": 7883.88,
+ "scores": {
+  "simplicity": 92.0,
+  "resilience": 50.0,
+  "cost": 70.0,
+  "security": 0.0,
+  "governance": 90.0
+ },
+ "findings": [
+  {
+   "fingerprint": "f1",
+   "severity": "critical",
+   "axis": "security",
+   "rule_id": "SEC-ENC-006",
+   "title": "aws_db_instance.ledger stores data unencrypted at rest",
+   "estimated_monthly_saving_usd": null,
+   "rationale": "aws_db_instance.ledger sets encryption at rest to false. Anyone who obtains the underlying volume, a snapshot or a backup reads the data without a key, and the control cannot be turned on later without recreating the resource.",
+   "remediation": "Set `storage_encrypted = true` and supply a CMK via `kms_key_id`. The change requires a rebuild, so it is far cheaper to do before launch.",
+   "evidence": [
+    {
+     "locator": "aws_db_instance.ledger.storage_encrypted",
+     "source": "main.tf",
+     "line": 148,
+     "snippet": "storage_encrypted = false"
+    }
+   ]
+  },
+  {
+   "fingerprint": "f2",
+   "severity": "critical",
+   "axis": "security",
+   "rule_id": "SEC-EXP-007",
+   "title": "aws_db_instance.ledger is directly reachable from the internet",
+   "estimated_monthly_saving_usd": null,
+   "rationale": "aws_db_instance.ledger is a database with a public endpoint, so the only thing standing between the internet and the data is its credentials. Every network control declared for the zone is bypassed by a client that connects directly.",
+   "remediation": "Set `publicly_accessible = false` and reach the instance over the VPC, through the load balancer or endpoint that already fronts it.",
+   "evidence": [
+    {
+     "locator": "aws_db_instance.ledger.publicly_accessible",
+     "source": "main.tf",
+     "line": 150,
+     "snippet": "publicly_accessible = true"
+    }
+   ]
+  },
+  {
+   "fingerprint": "f3",
+   "severity": "critical",
+   "axis": "security",
+   "rule_id": "SEC-SEC-008",
+   "title": "local.ledger_password holds a credential in source control",
+   "estimated_monthly_saving_usd": null,
+   "rationale": "`ledger_password` is assigned a literal value in the Terraform. It is in git history, in every clone and in every CI log that echoes the plan, so rotating it means rotating the credential, not editing the file.",
+   "remediation": "Move the value into the platform secret manager and reference it (`data.vault_generic_secret`, AWS Secrets Manager or GCP Secret Manager), then rotate the exposed credential: it must be treated as compromised.",
+   "evidence": [
+    {
+     "locator": "local.ledger_password",
+     "source": "main.tf",
+     "line": 39,
+     "snippet": "ledger_password = <redacted>"
+    }
+   ]
+  },
+  {
+   "fingerprint": "f4",
+   "severity": "high",
+   "axis": "resilience",
+   "rule_id": "RES-AZ-003",
+   "title": "aws_db_instance.ledger is single-AZ on a Tier 1 service",
+   "estimated_monthly_saving_usd": null,
+   "rationale": "aws_db_instance.ledger runs in one availability zone while carrying a Tier 1 service. A single zone failure takes the service down for as long as the zone is out, which no Tier 1 recovery target survives.",
+   "remediation": "Set `multi_az = true` (or `availability_type = \"REGIONAL\"` on Cloud SQL) so the standby is in a second zone and failover is automatic.",
+   "evidence": [
+    {
+     "locator": "aws_db_instance.ledger.multi_az",
+     "source": "main.tf",
+     "line": 147,
+     "snippet": "multi_az = false"
+    }
+   ]
+  },
+  {
+   "fingerprint": "f5",
+   "severity": "high",
+   "axis": "resilience",
+   "rule_id": "RES-BKP-004",
+   "title": "aws_db_instance.ledger has backups switched off",
+   "estimated_monthly_saving_usd": null,
+   "rationale": "aws_db_instance.ledger holds state and sets its backup retention to zero. There is no recovery point: corruption, an accidental delete or a failed migration is unrecoverable, and no RPO can be evidenced for it.",
+   "remediation": "Set `backup_retention_period` to the retention the service tier requires and confirm the restore path has actually been exercised.",
+   "evidence": [
+    {
+     "locator": "aws_db_instance.ledger.backup_retention_period",
+     "source": "main.tf",
+     "line": 149,
+     "snippet": "backup_retention_period = 0"
+    }
+   ]
+  },
+  {
+   "fingerprint": "f6",
+   "severity": "high",
+   "axis": "security",
+   "rule_id": "SEC-TLS-005",
+   "title": "aws_lb_listener.public accepts TLS 1.0/1.1",
+   "estimated_monthly_saving_usd": null,
+   "rationale": "aws_lb_listener.public uses `ELBSecurityPolicy-TLS-1-0-2015-04`, which still negotiates TLS 1.0 and 1.1. Both are withdrawn (RFC 8996) and neither is acceptable for a service handling customer data.",
+   "remediation": "Move to `ELBSecurityPolicy-TLS13-1-2-2021-06`, which floors the negotiation at TLS 1.2 and adds 1.3.",
+   "evidence": [
+    {
+     "locator": "aws_lb_listener.public.ssl_policy",
+     "source": "main.tf",
+     "line": 205,
+     "snippet": "ssl_policy = \"ELBSecurityPolicy-TLS-1-0-2015-04\""
+    }
+   ]
+  },
+  {
+   "fingerprint": "f7",
+   "severity": "medium",
+   "axis": "cost",
+   "rule_id": "COST-HANP-016",
+   "title": "google_sql_database_instance.analytics runs REGIONAL in dev",
+   "estimated_monthly_saving_usd": null,
+   "rationale": "google_sql_database_instance.analytics is configured for regional high availability in the dev environment, so a standby is provisioned and billed around the clock to protect a non-production workload.",
+   "remediation": "Set `availability_type = \"ZONAL\"` for non-production, and verify the change actually landed.",
+   "evidence": [
+    {
+     "locator": "google_sql_database_instance.analytics.availability_type",
+     "source": "main.tf",
+     "line": 169,
+     "snippet": "availability_type = \"REGIONAL\""
+    }
+   ]
+  },
+  {
+   "fingerprint": "f8",
+   "severity": "medium",
+   "axis": "cost",
+   "rule_id": "COST-IDLE-019",
+   "title": "google_container_node_pool.scoring holds 2 GPU nodes permanently online",
+   "estimated_monthly_saving_usd": 7883.88,
+   "rationale": "google_container_node_pool.scoring autoscales but never below 2 node(s), each carrying a GPU accelerator. GPU nodes are the most expensive unit in the catalogue and this pool pays for 2 of them continuously, whether or not any job is running.",
+   "remediation": "Set `min_node_count = 0` so the pool scales to zero between jobs. Accelerated workloads are bursty; the floor is what makes them expensive.",
+   "evidence": [
+    {
+     "locator": "google_container_node_pool.scoring.min_node_count",
+     "source": "main.tf",
+     "line": 72,
+     "snippet": "min_node_count = 2"
+    }
+   ]
+  },
+  {
+   "fingerprint": "f9",
+   "severity": "medium",
+   "axis": "governance",
+   "rule_id": "GOV-META-014",
+   "title": "2 governance field(s) not declared",
+   "estimated_monthly_saving_usd": null,
+   "rationale": "The design does not declare its TRM/TAP id or a cloud exit plan (required for Tier 1). These are the fields a design review is assessed against, and each one is cheap to record now and expensive to reconstruct later.",
+   "remediation": "Declare the missing values in the design's `locals` block so they travel with the code that implements them.",
+   "evidence": [
+    {
+     "locator": "locals",
+     "source": "main.tf",
+     "line": 26,
+     "snippet": "locals {"
+    }
+   ]
+  },
+  {
+   "fingerprint": "f10",
+   "severity": "low",
+   "axis": "simplicity",
+   "rule_id": "SIMP-DEAD-013",
+   "title": "aws_s3_bucket.landing is declared but never referenced",
+   "estimated_monthly_saving_usd": null,
+   "rationale": "Nothing in this design references aws_s3_bucket.landing, and no output exports it. Either a consumer is missing from the design or the resource is left over, and it is still in scope for every control that applies to it.",
+   "remediation": "Remove the resource, or add the reference or output that shows what consumes it.",
+   "evidence": [
+    {
+     "locator": "aws_s3_bucket.landing",
+     "source": "main.tf",
+     "line": 175,
+     "snippet": "resource \"aws_s3_bucket\" \"landing\" {"
+    }
+   ]
+  }
+ ],
+ "rules_skipped": [],
+ "notes": [
+  "Sample data from the local mock server: figures and rules are illustrative, not a real ArchLint run.",
+  "5 of 8 components carry no published price and are excluded from the total, which is therefore a floor and not a forecast.",
+  "kubernetes_deployment.ingest was priced against an assumed market, not a declared one."
+ ],
+ "run_cost": {
+  "coverage": 0.38,
+  "priced_components": 3,
+  "monthly_usd": 18135.85,
+  "lines": [
+   {
+    "component_id": "google_container_node_pool.platform",
+    "assumed": false,
+    "driver": null,
+    "monthly_usd": 9522.89,
+    "quantity": 8760,
+    "unit": "node-hour",
+    "unit_price": 1.087088,
+    "basis": "12 x n2-standard-16 node(s) (fixed node count) x 730 h = 8760 node-hours.",
+    "citation": "Sample rate card (mock)"
+   },
+   {
+    "component_id": "google_container_node_pool.scoring",
+    "assumed": false,
+    "driver": null,
+    "monthly_usd": 7883.88,
+    "quantity": 1460,
+    "unit": "node-hour",
+    "unit_price": 5.399916,
+    "basis": "2 x GPU node(s) (autoscaling floor) x 730 h = 1460 node-hours.",
+    "citation": "Sample rate card (mock)"
+   },
+   {
+    "component_id": "kubernetes_deployment.ingest",
+    "assumed": true,
+    "driver": "cpu_request",
+    "monthly_usd": 729.08,
+    "quantity": 973.33,
+    "unit": "GiB/day",
+    "unit_price": 0.74905,
+    "basis": "32 GiB billable (driven by `cpu_request`) x 30.42 days = 973.3 GiB-days. Region not declared; market assumed.",
+    "citation": "Sample rate card (mock)"
+   }
+  ],
+  "unpriced": [
+   {
+    "component_id": "aws_db_instance.ledger",
+    "reason": "No rate card covers aws_db_instance; the published tables price compute node-hours and container workloads only."
+   },
+   {
+    "component_id": "google_sql_database_instance.analytics",
+    "reason": "No rate card covers google_sql_database_instance."
+   },
+   {
+    "component_id": "aws_s3_bucket.landing",
+    "reason": "No rate card covers aws_s3_bucket."
+   },
+   {
+    "component_id": "aws_s3_bucket.legacy_extracts",
+    "reason": "No rate card covers aws_s3_bucket."
+   },
+   {
+    "component_id": "aws_lb_listener.public",
+    "reason": "No rate card covers aws_lb_listener."
+   }
+  ]
+ }
+}

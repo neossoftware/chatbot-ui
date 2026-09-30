@@ -4,6 +4,8 @@
 import http from 'node:http'
 import { readFileSync } from 'node:fs'
 
+const REVIEW = JSON.parse(readFileSync(new URL('./review-result.json', import.meta.url), 'utf8'))
+
 const json = (res, status, body) => {
   res.writeHead(status, { 'Content-Type': 'application/json' })
   res.end(JSON.stringify(body))
@@ -85,6 +87,25 @@ http.createServer(async (req, res) => {
     if (!prompt) return json(res, 422, { detail: 'prompt is required' })
     await sleep(1200)
     return json(res, 200, { filename: 'aws-architecture.drawio', download_url: '/v1/diagram/download/aws-architecture.drawio' })
+  }
+  // Architecture review (ArchLint): same three routes and one result shape as the real service.
+  if (req.method === 'POST' && req.url.startsWith('/v1/review')) {
+    const route = req.url.split('?')[0]
+    let source = { kind: 'paste' }
+    if (route === '/v1/review') {
+      const { files } = await readBody(req)
+      if (!files || !Object.values(files).some((t) => String(t).trim())) return json(res, 422, { detail: 'No Terraform was provided.' })
+    } else if (route === '/v1/review/github') {
+      const { url } = await readBody(req)
+      const m = /github\.com\/([^/]+)\/([^/]+)(?:\/tree\/([^/]+)\/?(.*))?/.exec(url || '')
+      if (!m) return json(res, 422, { detail: `Not a public GitHub repository URL: ${url}` })
+      source = { kind: 'github', owner: m[1], repo: m[2], ref: m[3] || 'main', path: m[4] || '', url }
+    } else if (route === '/v1/review/upload') {
+      req.resume() // multipart body is not needed by the mock
+      source = { kind: 'upload' }
+    } else return json(res, 404, { detail: 'Not found' })
+    await sleep(2200)
+    return json(res, 200, { ...REVIEW, source })
   }
   if (req.method === 'GET' && req.url.startsWith('/v1/diagram/download/')) {
     res.writeHead(200, { 'Content-Type': 'application/xml', 'Content-Disposition': 'attachment; filename="aws-architecture.drawio"' })

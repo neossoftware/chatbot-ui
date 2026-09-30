@@ -1,9 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { ReviewSourceTabs, ReviewOptions, ReviewSubmission, ReviewProgress, SOURCE_HINT } from './ReviewPanel.jsx'
+import ReviewResult from './ReviewResult.jsx'
 
 const COPILOT_URL = '/api/chat'
 const DIAGRAM_URL = '/api/diagram'
+const REVIEW_URL = '/api/review'
+const REVIEW_UPLOAD_URL = '/api/review/upload'
+const REVIEW_GITHUB_URL = '/api/review/github'
 const GATEWAY_KEY = 'sk-arch-bot-gateway-key'
 
 // Static catalog of models confirmed to work against /v1/chat/completions
@@ -54,6 +59,7 @@ const TIER_LABEL = { 1: 'Low cost', 2: 'Standard', 3: 'Premium' }
 // changes needed - the combined text is sent as a normal string `content`.
 const MAX_FILE_SIZE = 200 * 1024 // 200 KB per file
 const MAX_TOTAL_SIZE = 500 * 1024 // 500 KB combined per message
+const MAX_ZIP_SIZE = 25 * 1024 * 1024 // 25 MB for a Terraform .zip / .tf in review mode
 const ALLOWED_EXTENSIONS = [
   '.txt', '.md', '.markdown', '.json', '.yaml', '.yml', '.csv', '.log',
   '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.xml', '.sql', '.sh',
@@ -68,10 +74,10 @@ const EXT_TO_LANG = {
 }
 
 const STARTERS = [
-  { label: 'Generate diagram', diagram: true, prompt: '' },
-  { label: 'Review design', prompt: 'Review this design for single points of failure and security gaps:\n\n' },
-  { label: 'Explain pattern', prompt: 'Explain when to use the circuit breaker pattern between a service and the LLM gateway.' },
-  { label: 'Analyse document', prompt: 'Analyse this architecture document and list the components, dependencies and risks:\n\n' },
+  { label: 'Generate diagram', icon: 'diagram', diagram: true, prompt: '' },
+  { label: 'Review design', icon: 'review', review: true, prompt: '' },
+  { label: 'Explain pattern', icon: 'explain', prompt: 'Explain when to use the circuit breaker pattern between a service and the LLM gateway.' },
+  { label: 'Analyse document', icon: 'analyse', prompt: 'Analyse this architecture document and list the components, dependencies and risks:\n\n' },
 ]
 
 function getExtension(filename) {
@@ -91,6 +97,9 @@ function buildMessageWithAttachments(text, attachments) {
 const Icon = {
   plus: <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M8 2v12M2 8h12" /></svg>,
   diagram: <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"><rect x="1.5" y="1.5" width="5" height="4" rx="1" /><rect x="9.5" y="10.5" width="5" height="4" rx="1" /><path d="M4 5.5V8h8v2.5" /></svg>,
+  review: <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M8 1.5 13 3.5v3.7c0 3-2.1 5-5 5.8-2.9-.8-5-2.8-5-5.8V3.5Z" /><path d="m5.8 8 1.6 1.6L10.4 6.5" /></svg>,
+  explain: <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M6 12.5h4M6.5 14.5h3M8 1.5a4.5 4.5 0 0 0-2.6 8.2c.4.3.6.8.6 1.3h4c0-.5.2-1 .6-1.3A4.5 4.5 0 0 0 8 1.5Z" /></svg>,
+  analyse: <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 1.5H4.5a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1H8M9 1.5l3.5 3.5V7M9 1.5V5h3.5" /><circle cx="11.5" cy="11.5" r="2.2" /><path d="m13.2 13.2 1.5 1.5" /></svg>,
   caret: <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"><path d="m2.5 4.5 3.5 3.5 3.5-3.5" /></svg>,
   stop: <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><rect x="3" y="3" width="10" height="10" rx="2" /></svg>,
   up: <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 15V3M3.5 8.5 9 3l5.5 5.5" /></svg>,
@@ -133,6 +142,15 @@ export default function ChatBot() {
   const [menuOpen, setMenuOpen] = useState(false)
   const [diagramLoading, setDiagramLoading] = useState(false)
   const [diagramMode, setDiagramMode] = useState(false)
+  const [reviewMode, setReviewMode] = useState(false)
+  const [reviewSource, setReviewSource] = useState('paste')
+  const [reviewEnv, setReviewEnv] = useState('unknown')
+  const [reviewMarket, setReviewMarket] = useState('')
+  const [reviewInvalid, setReviewInvalid] = useState({ env: false, market: false })
+  const [optionsSignal, setOptionsSignal] = useState(0)
+  const [reviewZip, setReviewZip] = useState(null)
+  const [reviewRepo, setReviewRepo] = useState('')
+  const [reviewLoading, setReviewLoading] = useState(false)
   const [attachments, setAttachments] = useState([])
   const [attachmentError, setAttachmentError] = useState(null)
   const bottomRef = useRef(null)
@@ -140,9 +158,13 @@ export default function ChatBot() {
   const revealTimerRef = useRef(null)
   const fileInputRef = useRef(null)
   const abortRef = useRef(null)
+  const zipInputRef = useRef(null)
+  const threadRef = useRef(null)
+  const stickRef = useRef(true)
+  const draftsRef = useRef({ chat: '', diagram: '', review: '' })
   const stopRevealRef = useRef(null)
 
-  const busy = loading || streaming || diagramLoading
+  const busy = loading || streaming || diagramLoading || reviewLoading
   const started = messages.length > 0 || busy
 
   useEffect(() => {
@@ -169,6 +191,15 @@ export default function ChatBot() {
     // While the typewriter effect is running, `messages` updates on every tick (every 30ms).
     // Smooth-scrolling on each tick keeps restarting the animation and reads as jitter,
     // so use instant scrolling during streaming and animate only for discrete events.
+    //
+    // A finished review is the exception: it is a long report, so show it from its first line
+    // (the headline numbers) instead of dropping the reader at the bottom of it.
+    if (messages.at(-1)?.reviewResult) {
+      stickRef.current = false
+      const results = threadRef.current?.querySelectorAll('[data-result]')
+      results?.[results.length - 1]?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      return
+    }
     bottomRef.current?.scrollIntoView({ behavior: streaming ? 'auto' : 'smooth', block: 'end' })
   }, [messages, loading, streaming])
 
@@ -177,11 +208,24 @@ export default function ChatBot() {
   }, [])
 
   useEffect(() => {
+    // The dock grows and shrinks (review panel, tall textarea) and squeezes the thread. If the user was
+    // reading the latest message, keep it in view instead of letting the dock cover the last lines.
+    const el = threadRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => {
+      if (stickRef.current) el.scrollTop = el.scrollHeight
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  useEffect(() => {
     const el = textareaRef.current
     if (!el) return
     el.style.height = 'auto'
     el.style.height = el.scrollHeight + 'px' // CSS max-height caps it, then the textarea scrolls
-  }, [input])
+    // reviewMode / reviewSource swap the textarea for a new element, so its height must be recalculated too
+  }, [input, reviewMode, reviewSource])
 
   useEffect(() => {
     if (!menuOpen) return
@@ -191,10 +235,18 @@ export default function ChatBot() {
   }, [menuOpen])
 
   const handleKeyDown = (e) => {
-    if (e.key === 'Backspace' && diagramMode && !input) setDiagramMode(false)
+    if (e.key === 'Backspace' && (diagramMode || reviewMode) && !input) switchMode('chat')
+    if (e.key === 'Enter' && reviewMode && reviewSource === 'paste') {
+      // Terraform is multi-line: plain Enter stays a newline, Ctrl/Cmd+Enter runs the review.
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault()
+        runReview()
+      }
+      return
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      diagramMode ? sendDiagram() : send()
+      diagramMode ? sendDiagram() : reviewMode ? runReview() : send()
     }
   }
 
@@ -495,6 +547,104 @@ export default function ChatBot() {
     }
   }
 
+  const reviewReady =
+    reviewSource === 'paste' ? Boolean(input.trim()) : reviewSource === 'zip' ? Boolean(reviewZip) : Boolean(reviewRepo.trim())
+
+  const handleZipSelected = (e) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    if (!/\.(zip|tf)$/i.test(file.name)) return setAttachmentError(`${file.name} is not a .zip or .tf file`)
+    if (file.size > MAX_ZIP_SIZE) return setAttachmentError(`${file.name} exceeds ${MAX_ZIP_SIZE / 1024 / 1024} MB`)
+    setAttachmentError(null)
+    setReviewZip(file)
+  }
+
+  // Architecture review (ArchLint). Three sources, one result shape:
+  //   paste  -> POST /api/review         JSON { files: { 'main.tf': ... }, env, default_region }
+  //   zip    -> POST /api/review/upload  multipart 'file', env / default_region as query params
+  //   github -> POST /api/review/github  JSON { url, env, default_region }
+  const runReview = async () => {
+    if (!reviewReady || busy) return
+    // Environment and market start unset on purpose: make the user choose them before anything is sent.
+    const missing = { env: reviewEnv === 'unknown', market: !reviewMarket }
+    if (missing.env || missing.market) {
+      setReviewInvalid(missing)
+      setOptionsSignal((n) => n + 1)
+      return
+    }
+    setReviewInvalid({ env: false, market: false })
+    const envValue = reviewEnv === 'unknown' ? null : reviewEnv
+    const region = reviewMarket || null
+    const what =
+      reviewSource === 'paste'
+        ? `Terraform pasted (${input.trim().split('\n').length} lines)`
+        : reviewSource === 'zip'
+          ? reviewZip.name
+          : reviewRepo.trim()
+    const review = {
+      source: reviewSource,
+      env: reviewEnv,
+      market: reviewMarket,
+      what,
+      code: reviewSource === 'paste' ? input : undefined,
+    }
+    const history = [...messages, { role: 'user', content: `Review: ${what}`, review }]
+    const zip = reviewZip
+    const repo = reviewRepo.trim()
+    const terraform = input
+    setMessages(history)
+    setInput('')
+    setReviewZip(null)
+    setReviewRepo('')
+    setReviewLoading(true)
+    setError(null)
+
+    try {
+      let res
+      if (reviewSource === 'zip') {
+        const params = new URLSearchParams()
+        if (envValue) params.set('env', envValue)
+        if (region) params.set('default_region', region)
+        const body = new FormData()
+        body.append('file', zip)
+        res = await fetch(`${REVIEW_UPLOAD_URL}?${params}`, { method: 'POST', body })
+      } else if (reviewSource === 'github') {
+        res = await fetch(REVIEW_GITHUB_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: repo, env: envValue, default_region: region }),
+        })
+      } else {
+        res = await fetch(REVIEW_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ files: { 'main.tf': terraform }, env: envValue, default_region: region }),
+        })
+      }
+      const body = await res.json().catch(() => null)
+      if (!res.ok) {
+        const detail = body?.detail
+        throw new Error(typeof detail === 'string' ? detail : detail ? JSON.stringify(detail) : `HTTP ${res.status}`)
+      }
+      setMessages([...history, { role: 'assistant', reviewResult: body }])
+    } catch (err) {
+      setMessages([...history, { role: 'assistant', content: `Could not run the review: ${err.message}`, refusal: true }])
+    } finally {
+      setReviewLoading(false)
+    }
+  }
+
+  // Each mode keeps its own draft: leaving a mode stores the text, entering one restores it.
+  const switchMode = (next) => {
+    const current = diagramMode ? 'diagram' : reviewMode ? 'review' : 'chat'
+    if (next === current) return
+    draftsRef.current[current] = input
+    setInput(draftsRef.current[next])
+    setDiagramMode(next === 'diagram')
+    setReviewMode(next === 'review')
+  }
+
   const stop = () => {
     stopRevealRef.current?.()
     abortRef.current?.abort()
@@ -502,16 +652,53 @@ export default function ChatBot() {
 
   const pickStarter = (s) => {
     if (s.diagram) {
-      setDiagramMode((v) => !v) // same chip again turns the mode off
+      switchMode(diagramMode ? 'chat' : 'diagram') // same chip again turns the mode off
+    } else if (s.review) {
+      switchMode(reviewMode ? 'chat' : 'review')
     } else {
+      switchMode('chat') // picking another starter leaves diagram / review mode
       setInput(s.prompt)
-      setDiagramMode(false) // picking another starter leaves diagram mode
     }
     textareaRef.current?.focus()
   }
 
   const generating = loading || streaming
-  const sendDisabled = diagramLoading || (!generating && !input.trim() && attachments.length === 0)
+  const sendDisabled = reviewMode
+    ? busy || !reviewReady
+    : diagramLoading || (!generating && !input.trim() && attachments.length === 0)
+
+
+  const gutterRef = useRef(null)
+  const lineCount = input.split('\n').length
+  const lineNumbers = Array.from({ length: lineCount }, (_, i) => i + 1).join('\n')
+  const syncGutter = (e) => {
+    if (gutterRef.current) gutterRef.current.scrollTop = e.target.scrollTop
+  }
+
+  const promptField = (
+        <textarea
+          id="prompt"
+          className={reviewMode ? 'code-input' : undefined}
+          spellCheck={reviewMode ? false : undefined}
+          wrap={reviewMode ? 'off' : undefined}
+          ref={textareaRef}
+          onScroll={syncGutter}
+          value={input}
+          onChange={(e) => {
+            setInput(e.target.value)
+          }}
+          onKeyDown={handleKeyDown}
+          disabled={streaming}
+          placeholder={
+            diagramMode
+              ? 'Describe the AWS architecture to diagram (e.g. EKS cluster, Multi-AZ, RDS)'
+              : reviewMode
+                ? 'Paste your Terraform here…'
+                : 'Paste your architecture document or type your question'
+          }
+          rows={2}
+        />
+  )
 
   return (
     <div className={'chat' + (started ? ' has-thread' : '')}>
@@ -521,13 +708,23 @@ export default function ChatBot() {
           <h1>What are we <b>designing</b> today?</h1>
         </section>
 
-        <section className="thread" aria-live="polite">
+        <section
+          className="thread"
+          aria-live="polite"
+          ref={threadRef}
+          onScroll={(e) => {
+            const el = e.currentTarget
+            stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+          }}
+        >
           {messages.map((m, i) => (
-            <div key={i} className={`msg ${m.role === 'user' ? 'user' : 'bot'}`}>
+            <div key={i} data-result={m.reviewResult ? '1' : undefined} className={`msg ${m.role === 'user' ? 'user' : 'bot'}`}>
               <span className="who">{m.role === 'user' ? 'You' : 'Architecture Bot'}</span>
-              <div className={`body${m.refusal ? ' refusal' : ''}${m.streaming ? ' streaming' : ''}`}>
+              <div className={`body${m.refusal ? ' refusal' : ''}${m.streaming ? ' streaming' : ''}${m.review ? ' has-card' : ''}${m.reviewResult ? ' wide' : ''}`}>
                 {m.role === 'assistant' ? (
-                  m.streaming ? (
+                  m.reviewResult ? (
+                    <ReviewResult result={m.reviewResult} />
+                  ) : m.streaming ? (
                     // While the typewriter reveal is mid-flight, `m.content` is incomplete
                     // markdown (an unclosed ``` code fence, a half-written heading, etc.).
                     // Re-parsing that on every tick makes react-markdown flip the DOM
@@ -538,23 +735,25 @@ export default function ChatBot() {
                     <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>{m.content}</Markdown>
                   )
                 ) : (
-                  m.displayContent || m.content
+                  m.review ? <ReviewSubmission review={m.review} /> : m.displayContent || m.content
                 )}
               </div>
             </div>
           ))}
           {(loading || diagramLoading) && <TypingIndicator />}
+          {reviewLoading && messages.at(-1)?.review && <ReviewProgress review={messages.at(-1).review} />}
           <div ref={bottomRef} />
         </section>
 
         <div className="dock">
           <div className="chips">
             {STARTERS.map((s) => (
-              <button key={s.label} type="button" className={`chip${s.diagram && diagramMode ? ' on' : ''}`} aria-pressed={s.diagram ? diagramMode : undefined} onClick={() => pickStarter(s)}>{s.label}</button>
+              <button key={s.label} type="button" className={`chip${(s.diagram && diagramMode) || (s.review && reviewMode) ? ' on' : ''}`} aria-pressed={s.diagram ? diagramMode : s.review ? reviewMode : undefined} onClick={() => pickStarter(s)}>{Icon[s.icon]}{s.label}</button>
             ))}
           </div>
 
           <div className="composer">
+            {reviewMode && <ReviewSourceTabs source={reviewSource} onSource={setReviewSource} onClose={() => switchMode('chat')} disabled={busy} />}
             <AttachmentChips attachments={attachments} onRemove={removeAttachment} disabled={busy} />
             <input
               ref={fileInputRef}
@@ -564,32 +763,68 @@ export default function ChatBot() {
               style={{ display: 'none' }}
               onChange={handleFilesSelected}
             />
-            <label htmlFor="prompt" className="sr">Message</label>
-            <textarea
-              id="prompt"
-              ref={textareaRef}
-              value={input}
-              onChange={(e) => {
-                setInput(e.target.value)
-              }}
-              onKeyDown={handleKeyDown}
-              disabled={streaming}
-              placeholder={
-                diagramMode
-                  ? 'Describe the AWS architecture to diagram (e.g. EKS cluster, Multi-AZ, RDS)'
-                  : 'Paste your architecture document or type your question'
-              }
-              rows={2}
-            />
-            <div className="hint">Enter to send · Shift + Enter starts a new line</div>
+            <input ref={zipInputRef} type="file" accept=".zip,.tf" style={{ display: 'none' }} onChange={handleZipSelected} />
+            {reviewMode && reviewSource === 'zip' && (
+              <button type="button" className="dropzone" onClick={() => zipInputRef.current?.click()} disabled={busy}>
+                {reviewZip ? (
+                  <><b>{reviewZip.name}</b><span>{Math.ceil(reviewZip.size / 1024)} KB · click to replace</span></>
+                ) : (
+                  <><b>Choose a .zip or .tf file</b><span>Up to {MAX_ZIP_SIZE / 1024 / 1024} MB</span></>
+                )}
+              </button>
+            )}
+            {reviewMode && reviewSource === 'zip' && reviewZip && (
+              <button type="button" className="mini remove-file" onClick={() => setReviewZip(null)} disabled={busy}>
+                Remove {reviewZip.name}
+              </button>
+            )}
+            {reviewMode && reviewSource === 'github' && (
+              <>
+                <label htmlFor="review-repo" className="sr">GitHub repository URL</label>
+                <input
+                  id="review-repo"
+                  className="repo-input"
+                  type="url"
+                  value={reviewRepo}
+                  onChange={(e) => setReviewRepo(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') runReview() }}
+                  placeholder="https://github.com/owner/repo/tree/main/infra/prod"
+                  disabled={busy}
+                />
+              </>
+            )}
+            {(!reviewMode || reviewSource === 'paste') && (
+              <>
+              <label htmlFor="prompt" className="sr">Message</label>
+            {reviewMode ? (
+              <div className="code-wrap">
+                <div className="gutter" ref={gutterRef} aria-hidden="true" style={{ width: `calc(${String(lineCount).length}ch + 26px)` }}>
+                  {lineNumbers}
+                </div>
+                {promptField}
+              </div>
+            ) : (
+              promptField
+            )}
+            <div className={`hint${reviewMode && (reviewInvalid.env || reviewInvalid.market) ? ' hint-error' : ''}`} role={reviewMode && (reviewInvalid.env || reviewInvalid.market) ? 'alert' : undefined}>
+              {reviewMode && (reviewInvalid.env || reviewInvalid.market)
+                ? `Choose ${reviewInvalid.env && reviewInvalid.market ? 'an Environment and a Default market' : reviewInvalid.env ? 'an Environment' : 'a Default market'} to run the review.`
+                : !reviewMode
+                ? 'Enter to send · Shift + Enter starts a new line'
+                : reviewSource === 'paste'
+                  ? reviewReady ? 'Ctrl/⌘ + Enter to run the review' : 'Paste your Terraform to enable the review'
+                  : SOURCE_HINT[reviewSource]}
+            </div>
+              </>
+            )}
             <div className="tools">
               <button
                 type="button"
                 className="icon-btn"
                 onClick={handleAttachClick}
-                disabled={busy || diagramMode}
+                disabled={busy || diagramMode || reviewMode}
                 aria-label="Attach file"
-                title={diagramMode ? 'Attachments are only available in chat mode' : 'Attach text/code files'}
+                title={diagramMode || reviewMode ? 'Attachments are only available in chat mode' : 'Attach text/code files'}
               >
                 {Icon.plus}
               </button>
@@ -597,7 +832,7 @@ export default function ChatBot() {
                 <button
                   type="button"
                   className="ghost diagram-btn active"
-                  onClick={() => setDiagramMode(false)}
+                  onClick={() => switchMode('chat')}
                   disabled={busy}
                   aria-label="Turn off diagram mode"
                   title="Turn off diagram mode"
@@ -607,37 +842,50 @@ export default function ChatBot() {
                   <span className="pill-x" aria-hidden="true">×</span>
                 </button>
               )}
+              {reviewMode && (
+                <ReviewOptions
+                  env={reviewEnv}
+                  onEnv={(v) => { setReviewEnv(v); if (v !== 'unknown') setReviewInvalid((m) => ({ ...m, env: false })) }}
+                  market={reviewMarket}
+                  onMarket={(v) => { setReviewMarket(v); if (v) setReviewInvalid((m) => ({ ...m, market: false })) }}
+                  disabled={busy}
+                  invalid={reviewInvalid}
+                  signal={optionsSignal}
+                />
+              )}
               <span className="spacer" />
-              <div className="mode">
-                <button
-                  type="button"
-                  className="ghost"
-                  aria-haspopup="menu"
-                  aria-expanded={menuOpen}
-                  disabled={busy || availableModels.length === 0}
-                  onClick={(e) => { e.stopPropagation(); setMenuOpen((o) => !o) }}
-                >
-                  <span style={{ display: 'inline' }}>{MODEL_CATALOG[model] || model || 'Model'}</span>{Icon.caret}
-                </button>
-                <div className="menu" role="menu" hidden={!menuOpen}>
-                  {availableModels.map((m) => (
-                    <button key={m} role="menuitemradio" aria-checked={m === model} onClick={() => setModel(m)}>
-                      <b>{MODEL_CATALOG[m] || m}</b>
-                      <span>{TIER_LABEL[MODEL_COST_TIER[m]] || ''}</span>
-                      <em>{m === model ? '✓' : ''}</em>
-                    </button>
-                  ))}
+              {!reviewMode && (
+                <div className="mode">
+                  <button
+                    type="button"
+                    className="ghost"
+                    aria-haspopup="menu"
+                    aria-expanded={menuOpen}
+                    disabled={busy || availableModels.length === 0}
+                    onClick={(e) => { e.stopPropagation(); setMenuOpen((o) => !o) }}
+                  >
+                    <span style={{ display: 'inline' }}>{MODEL_CATALOG[model] || model || 'Model'}</span>{Icon.caret}
+                  </button>
+                  <div className="menu" role="menu" hidden={!menuOpen}>
+                    {availableModels.map((m) => (
+                      <button key={m} role="menuitemradio" aria-checked={m === model} onClick={() => setModel(m)}>
+                        <b>{MODEL_CATALOG[m] || m}</b>
+                        <span>{TIER_LABEL[MODEL_COST_TIER[m]] || ''}</span>
+                        <em>{m === model ? '✓' : ''}</em>
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              )}
               <button
                 type="button"
-                className={`send${diagramMode ? ' diagram-active' : ''}${generating ? ' stop' : ''}`}
-                onClick={generating ? stop : diagramMode ? sendDiagram : send}
+                className={`send${diagramMode || reviewMode ? ' diagram-active' : ''}${reviewMode && !generating ? ' run' : ''}${generating ? ' stop' : ''}`}
+                onClick={generating ? stop : diagramMode ? sendDiagram : reviewMode ? runReview : send}
                 disabled={sendDisabled}
-                aria-label={generating ? 'Stop generating' : diagramMode ? 'Generate diagram' : 'Send'}
-                title={generating ? 'Stop generating' : diagramMode ? 'Generate diagram' : 'Send'}
+                aria-label={generating ? 'Stop generating' : diagramMode ? 'Generate diagram' : reviewMode ? 'Run review' : 'Send'}
+                title={generating ? 'Stop generating' : diagramMode ? 'Generate diagram' : reviewMode ? 'Run review' : 'Send'}
               >
-                {generating ? Icon.stop : diagramLoading ? <span className="spin" aria-hidden="true" /> : diagramMode ? Icon.diagram : Icon.up}
+                {generating ? Icon.stop : diagramLoading || reviewLoading ? <span className="spin" aria-hidden="true" /> : diagramMode ? Icon.diagram : reviewMode ? <>{Icon.review}<span>Run review</span></> : Icon.up}
               </button>
             </div>
           </div>

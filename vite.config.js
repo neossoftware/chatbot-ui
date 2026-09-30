@@ -25,6 +25,11 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api\/diagram/, '/v1/diagram'),
         changeOrigin: true,
       },
+      '/api/review': {
+        target: 'http://127.0.0.1:3030',
+        rewrite: (path) => path.replace(/^\/api\/review/, '/v1/review'),
+        changeOrigin: true,
+      },
     },
   },
 })
