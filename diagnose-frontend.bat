@@ -27,6 +27,7 @@ call :check src\components\HsbcLogo.jsx "HSBC" "logo component"
 call :check src\index.css "f5f5f6" "graphite light theme"
 call :check src\index.css "--col: 1080px" "wide layout"
 call :check src\index.css "review-result" "review result styles"
+call :check src\index.css "hint-error" "latest index.css (env/market validation)"
 echo.
 echo --- 3. Who is listening on port 5173
 netstat -ano | findstr ":5173" | findstr LISTENING
@@ -44,7 +45,7 @@ if exist node_modules\.vite (echo node_modules\.vite exists) else echo node_modu
 echo.
 echo --- 7. Versions
 node -v
-npm -v
+call npm -v
 echo.
 echo --- 8. Git
 where git >nul 2>&1 && (git log -1 --format="%%h %%ad %%s" --date=iso & git status --short) || echo git not available
