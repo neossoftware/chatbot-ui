@@ -2,6 +2,11 @@ import { useEffect, useState } from 'react'
 
 const svg = { width: 15, height: 15, viewBox: '0 0 16 16', 'aria-hidden': true }
 const SOURCE_ICON = {
+  describe: (
+    <svg {...svg} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2.5 3h11v7.5h-5.2L5 13v-2.5H2.5Z" />
+    </svg>
+  ),
   paste: (
     <svg {...svg} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
       <path d="m5.5 4.5-3.5 3.5 3.5 3.5M10.5 4.5 14 8l-3.5 3.5" />
@@ -25,6 +30,9 @@ export const REVIEW_SOURCES = [
   { id: 'zip', label: 'Upload .zip' },
   { id: 'github', label: 'GitHub repository' },
 ]
+// Generate diagram: describe it in words, or derive it from the same three Terraform sources the review accepts.
+export const DIAGRAM_SOURCES = [{ id: 'describe', label: 'Describe' }, ...REVIEW_SOURCES]
+export const SOURCE_LABEL = { describe: 'description', paste: 'Pasted Terraform', zip: 'Uploaded .zip', github: 'GitHub repository' }
 // The values are the engine's own `Environment` members; the labels are what an architect calls them.
 // Sending a label the enum does not know is rejected as a malformed request, so the two travel together.
 export const REVIEW_ENVIRONMENTS = [
@@ -40,25 +48,30 @@ export const REVIEW_MARKETS = ['', 'HK', 'UK', 'US', 'CN', 'MX']
 export const marketLabel = (m) => m || 'None'
 export const envLabel = (v) => REVIEW_ENVIRONMENTS.find((e) => e.value === v)?.label ?? v
 
+export const DIAGRAM_SOURCE_HINT = {
+  zip: 'A .zip or a single .tf file. A wrapping folder inside the zip is fine.',
+  github: 'Public repositories only. Paste the /tree/ URL of the root module you want to draw; given only owner/repo, the repository root is used.',
+}
+
 export const SOURCE_HINT = {
   zip: 'A wrapping folder inside the zip is fine. Terraform spread across several directories is refused: reviewing one of them silently would understate both the cost and the risk.',
   github: 'Public repositories only; nothing is cloned and no credentials are sent. A real estate keeps Terraform in several directories, so paste the /tree/ URL of the one root module you mean. Given only owner/repo, the repository root is reviewed.',
 }
 
 // Source tabs sit on top of the input they control.
-export function ReviewSourceTabs({ source, onSource, onClose, disabled }) {
+export function ReviewSourceTabs({ sources = REVIEW_SOURCES, tag = 'Deterministic · ARCHLINT', source, onSource, onClose, disabled }) {
   return (
     <div className="review-top">
       <div className="segmented" role="radiogroup" aria-label="Review source">
-        {REVIEW_SOURCES.map((s) => (
+        {sources.map((s) => (
           <button key={s.id} type="button" role="radio" aria-checked={source === s.id} disabled={disabled} onClick={() => onSource(s.id)}>
             {SOURCE_ICON[s.id]}
             {s.label}
           </button>
         ))}
       </div>
-      <span className="review-tag">Deterministic · ARCHLINT</span>
-      <button type="button" className="close-btn" onClick={onClose} disabled={disabled} aria-label="Exit review mode" title="Exit review mode">×</button>
+      <span className="review-tag">{tag}</span>
+      <button type="button" className="close-btn" onClick={onClose} disabled={disabled} aria-label="Exit this mode" title="Exit this mode">×</button>
     </div>
   )
 }
@@ -126,7 +139,6 @@ export function ReviewOptions({ env, onEnv, market, onMarket, disabled, invalid 
   )
 }
 
-const SOURCE_LABEL = { paste: 'Pasted Terraform', zip: 'Uploaded .zip', github: 'GitHub repository' }
 const MAX_SHOWN_LINES = 400
 
 // What the user just sent to the analyzer, shown in the thread in place of a plain message bubble.
@@ -157,32 +169,31 @@ export function ReviewSubmission({ review }) {
   )
 }
 
-// Step list shown while the analyzer runs. TODO(review backend): if the endpoint reports real progress,
-// drive `done` from those events instead of this timer.
-export function ReviewProgress({ review }) {
-  const steps = [
-    `Reading ${review.source === 'zip' ? 'the .zip' : review.source === 'github' ? 'the repository' : 'the Terraform'}`,
-    `Applying ${envLabel(review.env)} rules`,
-    review.market ? `Pricing with ${review.market} rates` : 'Pricing components with a declared region',
-    'Building the report',
-  ]
-  const [done, setDone] = useState(0)
+// Step list shown while a long task runs. The steps move on a timer, but the ending is real:
+//  - `holdLast` keeps the final step waiting (it does not start on its own);
+//  - `finished` (the service answered) ticks every step at once.
+// TODO(backend): if the services report real progress, drive the steps from those events instead.
+function ProgressCard({ title, steps, intervalMs, holdLast = false, finished = false }) {
+  const [step, setStep] = useState(0)
+  const cap = holdLast ? steps.length - 2 : steps.length - 1
 
   useEffect(() => {
-    const t = setInterval(() => setDone((d) => Math.min(d + 1, steps.length - 1)), 600)
+    const t = setInterval(() => setStep((d) => Math.min(d + 1, cap)), intervalMs)
     return () => clearInterval(t)
-  }, [steps.length])
+  }, [cap, intervalMs])
+
+  const shown = finished ? steps.length : step
 
   return (
     <div className="msg bot">
       <span className="who">Architecture Bot</span>
       <div className="body">
         <div className="progress-card" role="status" aria-live="polite">
-          <strong>Analyzing with ARCHLINT…</strong>
+          <strong>{title}</strong>
           <ol>
             {steps.map((label, i) => (
-              <li key={label} className={i < done ? 'done' : i === done ? 'active' : ''}>
-                <span className="step-mark" aria-hidden="true">{i < done ? '✓' : ''}</span>
+              <li key={label} className={i < shown ? 'done' : i === shown ? 'active' : ''}>
+                <span className="step-mark" aria-hidden="true">{i < shown ? '✓' : ''}</span>
                 {label}
               </li>
             ))}
@@ -191,4 +202,38 @@ export function ReviewProgress({ review }) {
       </div>
     </div>
   )
+}
+
+// Review: the engine answers in under a second on-prem, so the run is staged to last about 3 s:
+// steps tick every REVIEW_STEP_MS, ChatBot holds until REVIEW_MIN_MS, ticks everything, then shows the report.
+export const REVIEW_STEP_MS = 650
+export const REVIEW_MIN_MS = 2500
+export const REVIEW_FINISH_MS = 500
+
+export function ReviewProgress({ review, finished }) {
+  const steps = [
+    `Reading ${review.source === 'zip' ? 'the .zip' : review.source === 'github' ? 'the repository' : 'the Terraform'}`,
+    `Applying ${envLabel(review.env)} rules`,
+    review.market ? `Pricing with ${review.market} rates` : 'Pricing components with a declared region',
+    'Building the report',
+  ]
+  return <ProgressCard title="Analyzing with ARCHLINT…" steps={steps} intervalMs={REVIEW_STEP_MS} finished={finished} />
+}
+
+// Diagram: a model plans the drawing, so it takes as long as it takes. The steps advance slowly and wait on the
+// second-to-last one; when the endpoint answers they all tick and the file is handed over (DIAGRAM_FINISH_MS later).
+export const DIAGRAM_STEP_MS = 3500
+export const DIAGRAM_FINISH_MS = 700
+
+export function DiagramProgress({ source, finished }) {
+  const steps = [
+    source === 'describe'
+      ? 'Reading your description'
+      : `Reading the ${source === 'zip' ? '.zip' : source === 'github' ? 'repository' : 'Terraform'}`,
+    'Planning the architecture with the model',
+    'Placing the AWS accounts, VPCs and subnets',
+    'Placing the services and connecting them',
+    'Writing the .drawio file',
+  ]
+  return <ProgressCard title="Building your diagram…" steps={steps} intervalMs={DIAGRAM_STEP_MS} holdLast finished={finished} />
 }

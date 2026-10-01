@@ -82,6 +82,18 @@ http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/v1/models') {
     return json(res, 200, { data: ['claude-haiku-4.5', 'gpt-4o-mini', 'claude-sonnet-5'].map((id) => ({ id })) })
   }
+  // Diagram from Terraform (assumed routes, mirroring the review): pasted, uploaded or from GitHub.
+  if (req.method === 'POST' && /^\/v1\/diagram\/(terraform|upload|github)$/.test(req.url)) {
+    if (req.url.endsWith('/terraform')) {
+      const { files } = await readBody(req)
+      if (!files || !Object.values(files).some((t) => String(t).trim())) return json(res, 422, { detail: 'No Terraform was provided.' })
+    } else if (req.url.endsWith('/github')) {
+      const { url } = await readBody(req)
+      if (!/github\.com\/[^/]+\/[^/]+/.test(url || '')) return json(res, 422, { detail: `Not a public GitHub repository URL: ${url}` })
+    } else req.resume()
+    await sleep(1500)
+    return json(res, 200, { filename: 'aws-architecture.drawio' })
+  }
   if (req.method === 'POST' && req.url === '/v1/diagram') {
     const { prompt } = await readBody(req)
     if (!prompt) return json(res, 422, { detail: 'prompt is required' })

@@ -1,7 +1,11 @@
 import { useState, useRef, useEffect } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ReviewSourceTabs, ReviewOptions, ReviewSubmission, ReviewProgress, SOURCE_HINT } from './ReviewPanel.jsx'
+import {
+  ReviewSourceTabs, ReviewOptions, ReviewSubmission, ReviewProgress, DiagramProgress,
+  REVIEW_MIN_MS, REVIEW_FINISH_MS, DIAGRAM_FINISH_MS,
+  REVIEW_SOURCES, DIAGRAM_SOURCES, SOURCE_HINT, DIAGRAM_SOURCE_HINT, SOURCE_LABEL,
+} from './ReviewPanel.jsx'
 import ReviewResult from './ReviewResult.jsx'
 
 const COPILOT_URL = '/api/chat'
@@ -129,6 +133,14 @@ function TypingIndicator() {
   )
 }
 
+// Keep a progress card on screen for at least `minMs`, even when the service answers faster.
+const holdFor = (startedAt, minMs) => {
+  const left = minMs - (performance.now() - startedAt)
+  return left > 0 ? new Promise((r) => setTimeout(r, left)) : Promise.resolve()
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
 const mdComponents = { a: (props) => <a {...props} target="_blank" rel="noreferrer" /> }
 
 export default function ChatBot() {
@@ -144,6 +156,9 @@ export default function ChatBot() {
   const [diagramMode, setDiagramMode] = useState(false)
   const [reviewMode, setReviewMode] = useState(false)
   const [reviewSource, setReviewSource] = useState('paste')
+  const [diagramSource, setDiagramSource] = useState('describe')
+  const [diagramZip, setDiagramZip] = useState(null)
+  const [diagramRepo, setDiagramRepo] = useState('')
   const [reviewEnv, setReviewEnv] = useState('unknown')
   const [reviewMarket, setReviewMarket] = useState('')
   const [reviewInvalid, setReviewInvalid] = useState({ env: false, market: false })
@@ -151,6 +166,7 @@ export default function ChatBot() {
   const [reviewZip, setReviewZip] = useState(null)
   const [reviewRepo, setReviewRepo] = useState('')
   const [reviewLoading, setReviewLoading] = useState(false)
+  const [progressDone, setProgressDone] = useState(false) // the service answered: tick every progress step
   const [attachments, setAttachments] = useState([])
   const [attachmentError, setAttachmentError] = useState(null)
   const bottomRef = useRef(null)
@@ -161,7 +177,19 @@ export default function ChatBot() {
   const zipInputRef = useRef(null)
   const threadRef = useRef(null)
   const stickRef = useRef(true)
-  const draftsRef = useRef({ chat: '', diagram: '', review: '' })
+  const draftsRef = useRef({}) // one draft per mode and source, so each input keeps its own text
+
+  // The input that is active right now: diagram and review share the same source tabs.
+  const sourceMode = diagramMode || reviewMode
+  const activeSource = reviewMode ? reviewSource : diagramMode ? diagramSource : null
+  const sourceFile = reviewMode ? reviewZip : diagramZip
+  const setSourceFile = reviewMode ? setReviewZip : setDiagramZip
+  const sourceRepo = reviewMode ? reviewRepo : diagramRepo
+  const setSourceRepo = reviewMode ? setReviewRepo : setDiagramRepo
+  const isCode = sourceMode && activeSource === 'paste'
+  const showTextarea = !sourceMode || activeSource === 'paste' || activeSource === 'describe'
+  const diagramReady =
+    diagramSource === 'zip' ? Boolean(diagramZip) : diagramSource === 'github' ? Boolean(diagramRepo.trim()) : Boolean(input.trim())
   const stopRevealRef = useRef(null)
 
   const busy = loading || streaming || diagramLoading || reviewLoading
@@ -225,7 +253,7 @@ export default function ChatBot() {
     el.style.height = 'auto'
     el.style.height = el.scrollHeight + 'px' // CSS max-height caps it, then the textarea scrolls
     // reviewMode / reviewSource swap the textarea for a new element, so its height must be recalculated too
-  }, [input, reviewMode, reviewSource])
+  }, [input, reviewMode, reviewSource, diagramMode, diagramSource])
 
   useEffect(() => {
     if (!menuOpen) return
@@ -235,12 +263,13 @@ export default function ChatBot() {
   }, [menuOpen])
 
   const handleKeyDown = (e) => {
-    if (e.key === 'Backspace' && (diagramMode || reviewMode) && !input) switchMode('chat')
-    if (e.key === 'Enter' && reviewMode && reviewSource === 'paste') {
-      // Terraform is multi-line: plain Enter stays a newline, Ctrl/Cmd+Enter runs the review.
+    if (e.key === 'Backspace' && sourceMode && !input) switchMode('chat')
+    if (e.key === 'Escape' && sourceMode) switchMode('chat')
+    if (e.key === 'Enter' && isCode) {
+      // Terraform is multi-line: plain Enter stays a newline, Ctrl/Cmd+Enter submits.
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault()
-        runReview()
+        diagramMode ? sendDiagram() : runReview()
       }
       return
     }
@@ -307,23 +336,57 @@ export default function ChatBot() {
   // plans a sequence of drawio-mcp tool calls following the AWS containment
   // hierarchy skill, poc_server executes them against drawio-mcp.exe and
   // returns a .drawio file ready to download/open.
+  // Sources, same idea as the review: describe it, or derive it from Terraform (pasted, .zip or GitHub).
+  //   describe -> POST /api/diagram            JSON { prompt }
+  //   paste    -> POST /api/diagram/terraform  JSON { files: { 'main.tf': ... } }
+  //   zip      -> POST /api/diagram/upload     multipart 'file'
+  //   github   -> POST /api/diagram/github     JSON { url }
+  // TODO(diagram backend): the three Terraform routes mirror the review's; adjust them to the real service.
   const sendDiagram = async () => {
+    if (!diagramReady || loading || streaming || diagramLoading) return
+    const source = diagramSource
     const prompt = input.trim()
-    if (!prompt || loading || streaming || diagramLoading) return
+    const repo = diagramRepo.trim()
+    const zip = diagramZip
+    const terraform = input
+    const what =
+      source === 'describe'
+        ? prompt
+        : source === 'paste'
+          ? `Terraform pasted (${input.trim().split('\n').length} lines)`
+          : source === 'zip'
+            ? zip.name
+            : repo
 
-    const userMsg = { role: 'user', content: `📐 Diagram: ${prompt}` }
+    const userMsg = {
+      role: 'user',
+      content: source === 'describe' ? `📐 Diagram: ${prompt}` : `📐 Diagram from ${SOURCE_LABEL[source]}: ${what}`,
+      diagramSource: source,
+    }
+    setProgressDone(false)
     const history = [...messages, userMsg]
     setMessages(history)
     setInput('')
+    setDiagramZip(null)
+    setDiagramRepo('')
     setDiagramLoading(true)
     setError(null)
 
     try {
-      const res = await fetch(DIAGRAM_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
-      })
+      const json = (url, payload) =>
+        fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      let res
+      if (source === 'zip') {
+        const form = new FormData()
+        form.append('file', zip)
+        res = await fetch(`${DIAGRAM_URL}/upload`, { method: 'POST', body: form })
+      } else if (source === 'github') {
+        res = await json(`${DIAGRAM_URL}/github`, { url: repo })
+      } else if (source === 'paste') {
+        res = await json(`${DIAGRAM_URL}/terraform`, { files: { 'main.tf': terraform } })
+      } else {
+        res = await json(DIAGRAM_URL, { prompt })
+      }
       const body = await res.json().catch(() => null)
 
       if (!res.ok) {
@@ -331,6 +394,9 @@ export default function ChatBot() {
         setMessages([...history, { role: 'assistant', content: `Could not generate the diagram: ${detail}`, refusal: true }])
         return
       }
+
+      setProgressDone(true)
+      await sleep(DIAGRAM_FINISH_MS)
 
       // body.download_url is the raw backend path (/v1/diagram/download/...),
       // which the vite dev server doesn't know how to route (only /api/* is
@@ -557,7 +623,7 @@ export default function ChatBot() {
     if (!/\.(zip|tf)$/i.test(file.name)) return setAttachmentError(`${file.name} is not a .zip or .tf file`)
     if (file.size > MAX_ZIP_SIZE) return setAttachmentError(`${file.name} exceeds ${MAX_ZIP_SIZE / 1024 / 1024} MB`)
     setAttachmentError(null)
-    setReviewZip(file)
+    setSourceFile(file)
   }
 
   // Architecture review (ArchLint). Three sources, one result shape:
@@ -600,6 +666,8 @@ export default function ChatBot() {
     setReviewLoading(true)
     setError(null)
 
+    const startedAt = performance.now()
+    setProgressDone(false)
     try {
       let res
       if (reviewSource === 'zip') {
@@ -627,6 +695,9 @@ export default function ChatBot() {
         const detail = body?.detail
         throw new Error(typeof detail === 'string' ? detail : detail ? JSON.stringify(detail) : `HTTP ${res.status}`)
       }
+      await holdFor(startedAt, REVIEW_MIN_MS)
+      setProgressDone(true)
+      await sleep(REVIEW_FINISH_MS)
       setMessages([...history, { role: 'assistant', reviewResult: body }])
     } catch (err) {
       setMessages([...history, { role: 'assistant', content: `Could not run the review: ${err.message}`, refusal: true }])
@@ -636,13 +707,24 @@ export default function ChatBot() {
   }
 
   // Each mode keeps its own draft: leaving a mode stores the text, entering one restores it.
+  const draftKey = (mode, src) => (mode === 'chat' ? 'chat' : `${mode}:${src}`)
+
   const switchMode = (next) => {
     const current = diagramMode ? 'diagram' : reviewMode ? 'review' : 'chat'
     if (next === current) return
-    draftsRef.current[current] = input
-    setInput(draftsRef.current[next])
+    draftsRef.current[draftKey(current, activeSource)] = input
+    const nextSource = next === 'diagram' ? diagramSource : next === 'review' ? reviewSource : null
+    setInput(draftsRef.current[draftKey(next, nextSource)] ?? '')
     setDiagramMode(next === 'diagram')
     setReviewMode(next === 'review')
+  }
+
+  // Changing the source tab inside a mode swaps the draft too: Terraform and a description are different inputs.
+  const changeSource = (src) => {
+    const mode = diagramMode ? 'diagram' : 'review'
+    draftsRef.current[draftKey(mode, activeSource)] = input
+    setInput(draftsRef.current[draftKey(mode, src)] ?? '')
+    mode === 'diagram' ? setDiagramSource(src) : setReviewSource(src)
   }
 
   const stop = () => {
@@ -665,7 +747,9 @@ export default function ChatBot() {
   const generating = loading || streaming
   const sendDisabled = reviewMode
     ? busy || !reviewReady
-    : diagramLoading || (!generating && !input.trim() && attachments.length === 0)
+    : diagramMode
+      ? busy || !diagramReady
+      : diagramLoading || (!generating && !input.trim() && attachments.length === 0)
 
 
   const gutterRef = useRef(null)
@@ -675,12 +759,26 @@ export default function ChatBot() {
     if (gutterRef.current) gutterRef.current.scrollTop = e.target.scrollTop
   }
 
+  const hintError = reviewMode && (reviewInvalid.env || reviewInvalid.market)
+  const submitVerb = reviewMode ? 'run the review' : 'generate the diagram'
+  const hintText = hintError
+    ? `Choose ${reviewInvalid.env && reviewInvalid.market ? 'an Environment and a Default market' : reviewInvalid.env ? 'an Environment' : 'a Default market'} to run the review.`
+    : !sourceMode
+      ? 'Enter to send · Shift + Enter starts a new line'
+      : activeSource === 'describe'
+        ? 'Enter to generate the diagram · Shift + Enter starts a new line'
+        : activeSource === 'paste'
+          ? (reviewMode ? reviewReady : diagramReady)
+            ? `Ctrl/⌘ + Enter to ${submitVerb}`
+            : `Paste your Terraform to enable ${reviewMode ? 'the review' : 'the diagram'}`
+          : (reviewMode ? SOURCE_HINT : DIAGRAM_SOURCE_HINT)[activeSource]
+
   const promptField = (
         <textarea
           id="prompt"
-          className={reviewMode ? 'code-input' : undefined}
-          spellCheck={reviewMode ? false : undefined}
-          wrap={reviewMode ? 'off' : undefined}
+          className={isCode ? 'code-input' : undefined}
+          spellCheck={isCode ? false : undefined}
+          wrap={isCode ? 'off' : undefined}
           ref={textareaRef}
           onScroll={syncGutter}
           value={input}
@@ -690,11 +788,11 @@ export default function ChatBot() {
           onKeyDown={handleKeyDown}
           disabled={streaming}
           placeholder={
-            diagramMode
-              ? 'Describe the AWS architecture to diagram (e.g. EKS cluster, Multi-AZ, RDS)'
-              : reviewMode
+            sourceMode
+              ? activeSource === 'paste'
                 ? 'Paste your Terraform here…'
-                : 'Paste your architecture document or type your question'
+                : 'Describe the AWS architecture to diagram (e.g. EKS cluster, Multi-AZ, RDS)'
+              : 'Paste your architecture document or type your question'
           }
           rows={2}
         />
@@ -740,8 +838,9 @@ export default function ChatBot() {
               </div>
             </div>
           ))}
-          {(loading || diagramLoading) && <TypingIndicator />}
-          {reviewLoading && messages.at(-1)?.review && <ReviewProgress review={messages.at(-1).review} />}
+          {loading && <TypingIndicator />}
+          {diagramLoading && <DiagramProgress source={messages.at(-1)?.diagramSource || 'describe'} finished={progressDone} />}
+          {reviewLoading && messages.at(-1)?.review && <ReviewProgress review={messages.at(-1).review} finished={progressDone} />}
           <div ref={bottomRef} />
         </section>
 
@@ -753,7 +852,16 @@ export default function ChatBot() {
           </div>
 
           <div className="composer">
-            {reviewMode && <ReviewSourceTabs source={reviewSource} onSource={setReviewSource} onClose={() => switchMode('chat')} disabled={busy} />}
+            {sourceMode && (
+              <ReviewSourceTabs
+                sources={reviewMode ? REVIEW_SOURCES : DIAGRAM_SOURCES}
+                tag={reviewMode ? 'Deterministic · ARCHLINT' : 'Output · .drawio'}
+                source={activeSource}
+                onSource={changeSource}
+                onClose={() => switchMode('chat')}
+                disabled={busy}
+              />
+            )}
             <AttachmentChips attachments={attachments} onRemove={removeAttachment} disabled={busy} />
             <input
               ref={fileInputRef}
@@ -764,81 +872,75 @@ export default function ChatBot() {
               onChange={handleFilesSelected}
             />
             <input ref={zipInputRef} type="file" accept=".zip,.tf" style={{ display: 'none' }} onChange={handleZipSelected} />
-            {reviewMode && reviewSource === 'zip' && (
+            {sourceMode && activeSource === 'zip' && (
               <button type="button" className="dropzone" onClick={() => zipInputRef.current?.click()} disabled={busy}>
-                {reviewZip ? (
-                  <><b>{reviewZip.name}</b><span>{Math.ceil(reviewZip.size / 1024)} KB · click to replace</span></>
+                {sourceFile ? (
+                  <><b>{sourceFile.name}</b><span>{Math.ceil(sourceFile.size / 1024)} KB · click to replace</span></>
                 ) : (
                   <><b>Choose a .zip or .tf file</b><span>Up to {MAX_ZIP_SIZE / 1024 / 1024} MB</span></>
                 )}
               </button>
             )}
-            {reviewMode && reviewSource === 'zip' && reviewZip && (
-              <button type="button" className="mini remove-file" onClick={() => setReviewZip(null)} disabled={busy}>
-                Remove {reviewZip.name}
+            {sourceMode && activeSource === 'zip' && sourceFile && (
+              <button type="button" className="mini remove-file" onClick={() => setSourceFile(null)} disabled={busy}>
+                Remove {sourceFile.name}
               </button>
             )}
-            {reviewMode && reviewSource === 'github' && (
+            {sourceMode && activeSource === 'github' && (
               <>
-                <label htmlFor="review-repo" className="sr">GitHub repository URL</label>
+                <label htmlFor="source-repo" className="sr">GitHub repository URL</label>
                 <input
-                  id="review-repo"
+                  id="source-repo"
                   className="repo-input"
                   type="url"
-                  value={reviewRepo}
-                  onChange={(e) => setReviewRepo(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') runReview() }}
+                  value={sourceRepo}
+                  onChange={(e) => setSourceRepo(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') (diagramMode ? sendDiagram() : runReview()) }}
                   placeholder="https://github.com/owner/repo/tree/main/infra/prod"
                   disabled={busy}
                 />
               </>
             )}
-            {(!reviewMode || reviewSource === 'paste') && (
+            {showTextarea && (
               <>
-              <label htmlFor="prompt" className="sr">Message</label>
-            {reviewMode ? (
-              <div className="code-wrap">
-                <div className="gutter" ref={gutterRef} aria-hidden="true" style={{ width: `calc(${String(lineCount).length}ch + 26px)` }}>
-                  {lineNumbers}
-                </div>
-                {promptField}
-              </div>
-            ) : (
-              promptField
-            )}
-            <div className={`hint${reviewMode && (reviewInvalid.env || reviewInvalid.market) ? ' hint-error' : ''}`} role={reviewMode && (reviewInvalid.env || reviewInvalid.market) ? 'alert' : undefined}>
-              {reviewMode && (reviewInvalid.env || reviewInvalid.market)
-                ? `Choose ${reviewInvalid.env && reviewInvalid.market ? 'an Environment and a Default market' : reviewInvalid.env ? 'an Environment' : 'a Default market'} to run the review.`
-                : !reviewMode
-                ? 'Enter to send · Shift + Enter starts a new line'
-                : reviewSource === 'paste'
-                  ? reviewReady ? 'Ctrl/⌘ + Enter to run the review' : 'Paste your Terraform to enable the review'
-                  : SOURCE_HINT[reviewSource]}
-            </div>
+                <label htmlFor="prompt" className="sr">Message</label>
+                {isCode ? (
+                  <div className="code-wrap">
+                    <div className="gutter" ref={gutterRef} aria-hidden="true" style={{ width: `calc(${String(lineCount).length}ch + 26px)` }}>
+                      {lineNumbers}
+                    </div>
+                    {promptField}
+                  </div>
+                ) : (
+                  promptField
+                )}
               </>
             )}
+            <div className={`hint${hintError ? ' hint-error' : ''}`} role={hintError ? 'alert' : undefined}>
+              {hintText}
+            </div>
             <div className="tools">
               <button
                 type="button"
                 className="icon-btn"
                 onClick={handleAttachClick}
-                disabled={busy || diagramMode || reviewMode}
+                disabled={busy || sourceMode}
                 aria-label="Attach file"
-                title={diagramMode || reviewMode ? 'Attachments are only available in chat mode' : 'Attach text/code files'}
+                title={sourceMode ? 'Attachments are only available in chat mode' : 'Attach text/code files'}
               >
                 {Icon.plus}
               </button>
-              {diagramMode && (
+              {sourceMode && (
                 <button
                   type="button"
                   className="ghost diagram-btn active"
                   onClick={() => switchMode('chat')}
                   disabled={busy}
-                  aria-label="Turn off diagram mode"
-                  title="Turn off diagram mode"
+                  aria-label={`Exit ${diagramMode ? 'diagram' : 'review'} mode and go back to chat`}
+                  title="Back to chat (Esc)"
                 >
-                  {Icon.diagram}
-                  <span>Diagram mode</span>
+                  {diagramMode ? Icon.diagram : Icon.review}
+                  <span>{diagramMode ? 'Diagram mode' : 'Review mode'}</span>
                   <span className="pill-x" aria-hidden="true">×</span>
                 </button>
               )}
